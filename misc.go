@@ -10,6 +10,20 @@ import (
 	"github.com/gonum/plot/vg"
 )
 
+var tables = []string{
+	"accounts",
+	"addresses",
+	"contacts",
+	"emails",
+	"files",
+	"keys",
+	"labels",
+	"onboarding",
+	"threads",
+	"tokens",
+	"webhooks",
+}
+
 func tableSize(sess *r.Session, table string) uint64 {
 	cursor, err := r.Table(table).Map(func(row r.Term) interface{} {
 		return row.CoerceTo("string").CoerceTo("binary").Count()
