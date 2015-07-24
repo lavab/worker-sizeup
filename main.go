@@ -1,14 +1,17 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
 	"math/rand"
+	"os"
 	"time"
+
+	"stablelib.com/v1/uniuri"
 
 	log "github.com/Sirupsen/logrus"
 	r "github.com/dancannon/gorethink"
 	"github.com/namsral/flag"
-	"stablelib.com/v1/uniuri"
 )
 
 const (
@@ -21,6 +24,8 @@ var (
 	env           *string
 	tmpTable      *string
 	bigTables     = []string{"emails", "files"}
+
+	interactive *bool
 )
 
 func init() {
@@ -29,73 +34,92 @@ func init() {
 	rethinkdbHost = flag.String("rethinkdb_host", "localhost", "RethinkDB hostname or IP")
 	rethinkdbPort = flag.String("rethinkdb_port", "28015", "Port to connect to RethinkDB")
 	env = flag.String("env", "dev", "Application environment - dev/staging/prod")
-	tmpTable = flag.String("tmp_table", "tmp_"+uniuri.New(), "Table to save temporary results")
 	flag.Parse()
 }
 
+func setupTmpTable(sess *r.Session, tmpTable string) {
+	log.Info("Copying fields {id, size=0} from table 'accounts' to table ", tmpTable, "...")
+	log.Info("Starting setting up the tmp table.")
+	startTime := time.Now()
+	res, err := r.Db(*env).Table("accounts").Field("id").ForEach(func(account r.Term) interface{} {
+		return r.Db(*env).Table(tmpTable).Insert(map[string]interface{}{
+			"id":   account,
+			"size": 0,
+		})
+	}).RunWrite(sess)
+	if err != nil {
+		log.WithFields(map[string]interface{}{"error": err.Error()}).Fatal("Setting up tmp table failed.")
+	}
+	log.WithFields(map[string]interface{}{
+		"sttDuration": time.Now().Sub(startTime),
+		"sttTable":    tmpTable,
+		"sttResponse": res,
+	}).Info("Finished setting up the tmp table.")
+}
+
 func main() {
-	// Connecting to the database
-	addr := *rethinkdbHost + ":" + *rethinkdbPort
+	sess := dbConnect(*rethinkdbHost + ":" + *rethinkdbPort)
+	tmpTable := "tmp_" + uniuri.New()
+
+	tableCreate(sess, *env, tmpTable)
+	defer func() {
+		tableDrop(sess, *env, tmpTable)
+		sess.Close()
+	}()
+
+	setupTmpTable(sess, tmpTable)
+
+	fmt.Println("Done. Enter anything to end.")
+	bufio.NewReader(os.Stdin).ReadString('\n')
+}
+
+func dbConnect(addr string) *r.Session {
 	log.Info("Connecting to RethinkDB at ", addr)
-	sess, err := r.Connect(r.ConnectOpts{
-		Address:  addr,
-		Database: *env,
-	})
+	sess, err := r.Connect(r.ConnectOpts{Address: addr})
 	if err != nil {
 		log.Fatal(err.Error())
 	}
-	defer sess.Close()
+	return sess
+}
 
-	_, err = r.Db(*env).TableCreate(tmpTable).RunWrite(sess)
+func tableCreate(sess *r.Session, db string, table string) {
+	log.Info("Creating temp table ", table, " in db ", db, "...")
+	_, err := r.Db(db).TableCreate(table).RunWrite(sess)
 	if err != nil {
 		log.Fatal("Couldn't create temp table. ", err.Error())
 	}
-	log.Info("Created temp table ", *tmpTable, " in db ", *env)
+}
 
-	// init tmp table with accounts
-
-	// process array of table names (i.e. emails, files, etc.)
-	for _, t := range bigTables {
-		processTable(sess, t)
-	}
-
-	_, err = r.Db(*env).TableDrop(*tmpTable).RunWrite(sess)
+func tableDrop(sess *r.Session, db string, table string) {
+	log.Info("Dropping temp table ", table, " in db ", db, "...")
+	_, err := r.Db(db).TableDrop(table).RunWrite(sess)
 	if err != nil {
 		log.Fatal("Couldn't drop temp table. ", err.Error())
 	}
-	log.Info("Dropped temp table ", *tmpTable, " in db ", *env)
 }
 
-func processTable(sess *r.Session, table string) {
-	rows, err := r.Db(*env).Table(table).Run(sess)
-	if err != nil {
-		log.Fatal("Couldn't fetch rows for table ", table)
+// Not using WaitGroup because len(tables) might be too high for gorethink to handle comfortably (?)
+func processMultipleTablesConcurrently(sess *r.Session, tables []string, tableModifier func(*r.Session, string)) {
+	nWorkers := 4
+	jobs := make(chan string, len(tables))
+	done := make(chan struct{})
+
+	for i := 0; i < nWorkers; i++ {
+		go func(<-chan string, chan<- struct{}) {
+			for table := range jobs {
+				tableModifier(sess, table)
+			}
+			done <- struct{}{}
+		}(jobs, done)
 	}
-	defer rows.Close()
 
-	var doc map[string]interface{}
-	var size uint64
-	var id string
-	var ok bool
+	for _, t := range tables {
+		jobs <- t
+	}
+	close(jobs)
 
-	// WIP
-	for rows.Next(&doc) {
-		if size, ok = doc["size"].(uint64); !ok {
-			if id, ok = doc["id"].(string); !ok {
-				log.Warn("Found a document without ID! ", doc)
-				continue
-			}
-			sizeTerm, err := r.Db(*env).Table(table).Get(id).
-				CoerceTo("string").CoerceTo("binary").Count().Run(sess)
-			err = sizeTerm.One(&size)
-			if err != nil {
-				log.Warn("Couldn't compute the size of document ", id, ". It might've been deleted.", err)
-				continue
-			}
-		}
-		fmt.Println(doc)
-		return
-	} else {
-
+	for w := 0; w < nWorkers; w++ {
+		<-done
+		fmt.Println("Done!")
 	}
 }
